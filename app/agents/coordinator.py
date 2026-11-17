@@ -1,4 +1,4 @@
-"""Bounded multi-agent coordinator with shared per-request budgets."""
+"""Google ADK multi-agent orchestration for the read-only event assistant."""
 
 from __future__ import annotations
 
@@ -7,20 +7,19 @@ import json
 import re
 import time
 import unicodedata
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-from urllib.request import Request, urlopen
+from typing import Any, cast
+from uuid import uuid4
 
 from app.agent import AgentResult, ProviderError
-from app.mcp_client import MCPClientError, ScheduleMCPClient
-from app.resilience import CircuitBreaker, CircuitOpen, Deadline, run_with_retries
+from app.mcp_client import ScheduleMCPClient
+from app.resilience import CircuitBreaker
 from app.schemas import Session
 from app.tools import DemoTools
 
-COORDINATOR_PROMPT_VERSION = "eventops-coordinator-v1"
-SCHEDULE_AGENT_PROMPT_VERSION = "eventops-schedule-specialist-v1"
-FAQ_AGENT_PROMPT_VERSION = "eventops-faq-specialist-v1"
+COORDINATOR_PROMPT_VERSION = "eventops-adk-coordinator-v2"
 
 
 def schedule_query(message: str, sessions: list[Session]) -> dict[str, Any]:
@@ -28,34 +27,32 @@ def schedule_query(message: str, sessions: list[Session]) -> dict[str, Any]:
     normalized = "".join(char for char in normalized if not unicodedata.combining(char))
     normalized = re.sub(r"\bdev\b", "desenvolvimento", normalized)
 
-    def normalize_track(value: str) -> str:
-        return unicodedata.normalize("NFKD", value.casefold()).encode("ascii", "ignore").decode()
+    def token(value: str) -> str:
+        value = unicodedata.normalize("NFKD", value.casefold())
+        return "".join(c for c in value if not unicodedata.combining(c))
 
     track = next(
-        (
-            item.track
-            for item in sessions
-            if re.search(rf"\b{re.escape(normalize_track(item.track))}\b", normalized)
-        ),
+        (s.track for s in sessions if re.search(rf"\b{re.escape(token(s.track))}\b", normalized)),
         None,
     )
     level_aliases = {
         "iniciante": r"\biniciant(?:e|es)\b",
-        "intermediario": r"\bintermediari(?:o|a|os|as)\b",
-        "avancado": r"\bavancad(?:o|a|os|as)\b",
+        "intermediario": r"\bintermediari?(?:o|a|os|as)\b",
+        "avancado": r"\bavancad[oa]s?\b",
     }
     level = next(
         (
-            item.level
-            for item in sessions
-            if re.search(level_aliases[item.level.casefold()], normalized)
+            s.level
+            for s in sessions
+            if re.search(
+                level_aliases.get(s.level.casefold(), rf"\b{re.escape(token(s.level))}\b"),
+                normalized,
+            )
         ),
         None,
     )
-    match = re.search(r"(?:ap[oó]s|depois das?)\s*(\d{1,2})(?::(\d{2}))?", normalized)
-    after = None
-    if match:
-        after = f"2026-11-07T{int(match.group(1)):02d}:{int(match.group(2) or 0):02d}:00-03:00"
+    m = re.search(r"(?:ap[oó]s|depois das?)\s*(\d{1,2})(?::(\d{2}))?", normalized)
+    after = f"2026-11-07T{int(m.group(1)):02d}:{int(m.group(2) or 0):02d}:00-03:00" if m else None
     return {"track": track, "level": level, "after": after, "limit": 3}
 
 
@@ -67,59 +64,340 @@ class DelegationBudget:
     tool_calls: int = 0
     tools: list[str] = field(default_factory=list)
 
-    def delegate(self, name: str) -> None:
-        if self.delegations >= self.max_delegations:
-            raise ProviderError("O limite de três delegações foi atingido.")
-        self.delegations += 1
-        self.tools.append(f"delegate:{name}")
-
-    def record_tool(self, name: str) -> None:
-        if self.tool_calls >= self.max_tool_calls:
-            raise ProviderError("O limite global de chamadas foi atingido.")
-        self.tool_calls += 1
+    def record(self, name: str) -> None:
+        if name.startswith("delegate:"):
+            if self.delegations >= self.max_delegations:
+                raise ProviderError("O limite de três delegações foi atingido.")
+            self.delegations += 1
+        else:
+            if self.tool_calls >= self.max_tool_calls:
+                raise ProviderError("O limite global de chamadas foi atingido.")
+            self.tool_calls += 1
         self.tools.append(name)
 
+    def delegate(self, name: str) -> None:
+        self.record(f"delegate:{name}")
 
-class ScheduleAgent:
-    def __init__(self, sessions: list[Session], mcp: ScheduleMCPClient | None = None) -> None:
-        self.sessions = sessions
-        self.mcp = mcp
-
-    async def run(self, message: str, budget: DelegationBudget) -> dict[str, Any]:
-        budget.delegate("schedule_agent")
-        # The specialist extracts bounded filters; MCP performs the query.
-        if self.mcp is None:
-            budget.record_tool("schedule.list_sessions")
-            tools = DemoTools(self.sessions)
-            query = schedule_query(message, self.sessions)
-            query.pop("limit", None)
-            data = tools.list_sessions(**query)
-        else:
-            budget.record_tool("mcp.list_sessions")
-            data = await self.mcp.call_tool("list_sessions", schedule_query(message, self.sessions))
-        ids = [str(item["id"]) for item in data.get("sessions", [])]
-        if any(item not in {session.id for session in self.sessions} for item in ids):
-            raise ProviderError("O especialista retornou IDs desconhecidos.")
-        return {
-            "session_ids": ids,
-            "answer": (
-                "Encontrei sessões no catálogo."
-                if ids
-                else "Não encontrei sessões compatíveis com esses filtros."
-            ),
-        }
+    def record_tool(self, name: str) -> None:
+        self.record(name)
 
 
-class FAQAgent:
-    async def run(self, message: str, budget: DelegationBudget) -> dict[str, Any]:
-        budget.delegate("faq_agent")
-        tools = DemoTools([])
-        result = await asyncio.to_thread(tools.search_policy, message)
-        budget.record_tool("faq.search_policy")
-        return result
+class _OfflineADKLlm:
+    """Deterministic local ADK model used for offline runs and evals."""
+
+    def __new__(cls, model: str, kind: str, message: str, sessions: list[Session]) -> Any:
+        from google.adk.models import BaseLlm
+        from google.adk.models.llm_response import LlmResponse
+        from google.genai import types
+
+        class OfflineModel(BaseLlm):
+            kind: str
+            message: str
+            sessions: list[Any]
+
+            async def generate_content_async(
+                self, llm_request: Any, stream: bool = False
+            ) -> AsyncGenerator[Any, None]:
+                del stream
+                contents = llm_request.contents or []
+                if self.kind == "coordinator":
+                    target = _offline_route(self.message)
+                    call = types.FunctionCall(
+                        name="transfer_to_agent",
+                        args={"agent_name": target, "transfer_reason": "intent"},
+                    )
+                    yield LlmResponse(
+                        content=types.Content(role="model", parts=[types.Part(function_call=call)]),
+                        turn_complete=True,
+                    )
+                    return
+                declarations = []
+                for tool in llm_request.tools_dict:
+                    declarations.append(tool)
+                responses = {
+                    part.function_response.name: part.function_response.response
+                    for content in contents
+                    for part in (content.parts or [])
+                    if part.function_response
+                }
+                pending = [
+                    n
+                    for n in declarations
+                    if n in {"list_sessions", "search_policy"} and n not in responses
+                ]
+                if pending:
+                    name = pending[0]
+                    if name == "list_sessions":
+                        args = schedule_query(self.message, self.sessions)
+                    else:
+                        args = {"question": self.message}
+                    yield LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[
+                                types.Part(function_call=types.FunctionCall(name=name, args=args))
+                            ],
+                        ),
+                        turn_complete=True,
+                    )
+                    return
+                response = responses.get("list_sessions") or responses.get("search_policy")
+                if self.kind == "schedule_agent":
+                    sessions_found = (responses.get("list_sessions") or {}).get("sessions", [])
+                    ids = [str(item["id"]) for item in sessions_found]
+                    payload = {
+                        "answer": "Encontrei sessões no catálogo."
+                        if ids
+                        else "Não encontrei sessões compatíveis com esses filtros.",
+                        "session_ids": ids,
+                        "sources": [],
+                        "reservation_proposal": ids[0]
+                        if ids
+                        and any(w in self.message.casefold() for w in ("reserv", "vaga", "guardar"))
+                        else None,
+                    }
+                elif self.kind == "combined_agent":
+                    sessions_found = (responses.get("list_sessions") or {}).get("sessions", [])
+                    ids = [str(item["id"]) for item in sessions_found]
+                    faq = responses.get("search_policy") or {}
+                    schedule_answer = (
+                        "Encontrei sessões no catálogo."
+                        if ids
+                        else "Não encontrei sessões compatíveis com esses filtros."
+                    )
+                    payload = {
+                        "answer": " ".join(
+                            part for part in (schedule_answer, faq.get("answer", "")) if part
+                        ),
+                        "session_ids": ids,
+                        "sources": faq.get("sources", []),
+                        "reservation_proposal": ids[0]
+                        if ids
+                        and any(w in self.message.casefold() for w in ("reserv", "vaga", "guardar"))
+                        else None,
+                    }
+                else:
+                    payload = response or {
+                        "answer": "Não encontrei evidência suficiente.",
+                        "sources": [],
+                    }
+                    payload = {
+                        "answer": payload.get("answer", "Não encontrei evidência suficiente."),
+                        "session_ids": [],
+                        "sources": payload.get("sources", []),
+                        "reservation_proposal": None,
+                    }
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part(text=json.dumps(payload, ensure_ascii=False))],
+                    ),
+                    turn_complete=True,
+                )
+
+        return OfflineModel(model=model, kind=kind, message=message, sessions=sessions)
+
+
+def _ollama_adk_model(model: str, base_url: str, timeout_seconds: int) -> Any:
+    """Adapt Ollama's chat/tool-call API to the Google ADK BaseLlm contract."""
+    from google.adk.models import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    class OllamaADKLlm(BaseLlm):
+        base_url: str
+        timeout_seconds: int
+
+        async def generate_content_async(
+            self, llm_request: Any, stream: bool = False
+        ) -> AsyncGenerator[Any, None]:
+            del stream
+
+            def text_parts(content: Any) -> str:
+                return "".join(part.text or "" for part in (content.parts or []))
+
+            messages: list[dict[str, Any]] = []
+            system = getattr(llm_request.config, "system_instruction", None)
+            if system:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": system if isinstance(system, str) else text_parts(system),
+                    }
+                )
+            for content in llm_request.contents or []:
+                calls = [part.function_call for part in (content.parts or []) if part.function_call]
+                responses = [
+                    part.function_response
+                    for part in (content.parts or [])
+                    if part.function_response
+                ]
+                if calls:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": text_parts(content) or None,
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "id": call.id or f"call_{index}",
+                                    "function": {"name": call.name, "arguments": call.args or {}},
+                                }
+                                for index, call in enumerate(calls)
+                            ],
+                        }
+                    )
+                elif responses:
+                    for response in responses:
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_name": response.name,
+                                "tool_call_id": response.id or "",
+                                "content": json.dumps(response.response, ensure_ascii=False),
+                            }
+                        )
+                else:
+                    role = "assistant" if content.role == "model" else "user"
+                    messages.append({"role": role, "content": text_parts(content)})
+            tool_declarations = [
+                declaration
+                for tool in (getattr(llm_request.config, "tools", None) or [])
+                for declaration in (getattr(tool, "function_declarations", None) or [])
+            ]
+            body: dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0},
+            }
+            if tool_declarations:
+                body["tools"] = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": declaration.name,
+                            "description": declaration.description or "",
+                            "parameters": declaration.parameters.model_dump(
+                                mode="json", exclude_none=True
+                            )
+                            if declaration.parameters
+                            else {"type": "object", "properties": {}},
+                        },
+                    }
+                    for declaration in tool_declarations
+                ]
+
+            def invoke() -> dict[str, Any]:
+                from urllib.request import Request, urlopen
+
+                request = Request(
+                    f"{self.base_url.rstrip('/')}/api/chat",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    return cast(dict[str, Any], json.loads(response.read()))
+
+            result = await asyncio.to_thread(invoke)
+            message = result.get("message", {})
+            parts = [types.Part(text=message["content"])] if message.get("content") else []
+            for call in message.get("tool_calls", []):
+                function = call.get("function", {})
+                args = function.get("arguments", {})
+                if isinstance(args, str):
+                    args = json.loads(args)
+                parts.append(
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            id=call.get("id"), name=function.get("name"), args=args
+                        )
+                    )
+                )
+            if not parts:
+                raise ProviderError("Ollama encerrou sem texto ou chamada de ferramenta.")
+            usage = None
+            if isinstance(result.get("prompt_eval_count"), int) and isinstance(
+                result.get("eval_count"), int
+            ):
+                usage = types.GenerateContentResponseUsageMetadata(
+                    prompt_token_count=result["prompt_eval_count"],
+                    candidates_token_count=result["eval_count"],
+                )
+            yield LlmResponse(
+                content=types.Content(role="model", parts=parts),
+                turn_complete=True,
+                usage_metadata=usage,
+            )
+
+    return OllamaADKLlm(model=model, base_url=base_url, timeout_seconds=timeout_seconds)
+
+
+def _offline_route(message: str) -> str:
+    text = unicodedata.normalize("NFKD", message.casefold())
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    policy = any(
+        w in text
+        for w in (
+            "politica",
+            "regra",
+            "acessibilidade",
+            "cancel",
+            "inscricao",
+            "alimentacao",
+            "como faco",
+            "quais sao",
+            "qual e",
+            "fuso",
+            "faq",
+            "preco",
+            "empresa",
+            "confirme",
+            "confirmar",
+            "token",
+            "ignore",
+            "instrucoes",
+            "documento",
+            "reserve_seat",
+            "historico",
+            "cookie",
+            "vaga como confirmada",
+        )
+    )
+    policy = policy or bool(re.search(r"\breservas?\b", text))
+    schedule = any(
+        w in text
+        for w in (
+            "agenda",
+            "palestra",
+            "sessao",
+            "sessoes",
+            "apos",
+            "sugira",
+            "recomende",
+            "trilha",
+            "horario",
+            "iniciante",
+            "desenvolvimento",
+            "produto",
+            "seguranca",
+            "devops",
+            "quero reservar",
+            "guardar uma vaga",
+            "mostre uma opcao",
+            "reserve uma palestra",
+        )
+    )
+    if policy:
+        mixed = re.search(r"\be\s+(?:quais|qual|como|posso)\b", text)
+        return "combined_agent" if schedule and mixed else "faq_agent"
+    return "schedule_agent" if schedule else "faq_agent"
 
 
 class CoordinatorAgent:
+    """ADK Runner coordinator; ADK performs routing, delegation, and tool execution."""
+
     def __init__(
         self,
         sessions: list[Session],
@@ -136,359 +414,275 @@ class CoordinatorAgent:
         google_project: str | None = None,
         google_location: str = "us-central1",
     ) -> None:
-        self.sessions = sessions
-        self.mode = mode
-        self.model = model
-        self.timeout_seconds = timeout_seconds
-        self.use_mcp = use_mcp
-        self.circuit_breaker = circuit_breaker
-        self.database = database
-        self.api_key = api_key
-        self.ollama_base_url = ollama_base_url.rstrip("/")
-        self.vertex_ai = vertex_ai
-        self.google_project = google_project
-        self.google_location = google_location
-
-    async def _route_with_model(self, message: str) -> tuple[bool, bool]:
-        """Ask the configured model which bounded local specialists should run."""
-        instruction = (
-            "Classifique a solicitação para um assistente de evento. Responda somente JSON válido, "
-            "sem markdown e sem comentários, exatamente neste formato: "
-            '{"schedule":true,"faq":false}. '
-            "Use somente booleanos JSON. schedule=true para agenda/palestras; "
-            "faq=true para regras, informações e políticas. Para pedidos ambíguos, "
-            "marque faq=true. "
-            "Não responda ao usuário nem invente dados. Pergunta: " + message[:2000]
+        self.sessions, self.mode, self.model = sessions, mode, model
+        self.timeout_seconds, self.use_mcp, self.circuit_breaker = (
+            timeout_seconds,
+            use_mcp,
+            circuit_breaker,
         )
-        if self.mode == "live":
-            if not self.api_key and not self.vertex_ai:
-                raise ProviderError("GOOGLE_API_KEY não está configurada para o coordenador.")
+        self.database, self.api_key, self.ollama_base_url = database, api_key, ollama_base_url
+        self.vertex_ai, self.google_project, self.google_location = (
+            vertex_ai,
+            google_project,
+            google_location,
+        )
 
-            def invoke_google() -> str:
+    async def ask(self, message: str, history: list[str] | None = None) -> AgentResult:
+        started = time.monotonic()
+        budget = DelegationBudget()
+        adk_events: list[dict[str, str]] = []
+        adk_tools: list[str] = []
+        mcp: ScheduleMCPClient | None = None
+        try:
+            from google.adk.agents import Agent
+            from google.adk.runners import Runner
+            from google.adk.sessions import InMemorySessionService
+            from google.genai import types
+
+            model_for: Callable[[str], Any]
+            if self.mode == "live":
+                if not self.api_key and not self.vertex_ai:
+                    raise ProviderError("GOOGLE_API_KEY não está configurada para o coordenador.")
                 from google import genai
-                from google.genai import types
+                from google.adk.models.google_llm import Gemini
 
                 client = (
                     genai.Client(
-                        vertexai=True,
-                        project=self.google_project,
-                        location=self.google_location,
+                        vertexai=True, project=self.google_project, location=self.google_location
                     )
                     if self.vertex_ai
                     else genai.Client(api_key=self.api_key)
                 )
-                response = client.models.generate_content(
-                    model=self.model,
-                    contents=instruction,
-                    config=types.GenerateContentConfig(
-                        temperature=0,
-                        max_output_tokens=512,
-                    ),
-                )
-                parsed = getattr(response, "parsed", None)
-                if isinstance(parsed, dict):
-                    return json.dumps(parsed, ensure_ascii=False)
-                # Prefer the text convenience property, but some Vertex response
-                # candidates expose structured JSON only through content parts.
-                response_text = response.text or ""
-                if response_text.strip():
-                    return response_text
-                candidates = getattr(response, "candidates", None) or []
-                extracted: list[str] = []
-                diagnostics: list[str] = []
-                for candidate in candidates:
-                    content = getattr(candidate, "content", None)
-                    finish = getattr(candidate, "finish_reason", None)
-                    diagnostics.append(f"finish={finish}")
-                    for part in getattr(content, "parts", None) or []:
-                        text_value = getattr(part, "text", None)
-                        if text_value:
-                            extracted.append(str(text_value))
-                        else:
-                            diagnostics.append(
-                                "part="
-                                f"{type(part).__name__},function_call="
-                                f"{bool(getattr(part, 'function_call', None))}"
-                            )
-                if extracted:
-                    return "\n".join(extracted)
-                prompt_feedback = getattr(response, "prompt_feedback", None)
-                block_reason = getattr(prompt_feedback, "block_reason", None)
-                raise ProviderError(
-                    "Vertex não retornou texto de rota "
-                    f"(parsed={type(parsed).__name__},block={block_reason},{','.join(diagnostics)[:120]})."
-                )
+                model_backend: Any = Gemini(model=self.model, client=client)
 
-            raw = await asyncio.to_thread(invoke_google)
-        elif self.mode == "local":
-            body = json.dumps(
-                {
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": instruction}],
-                    "format": "json",
-                    "stream": False,
-                    "options": {"temperature": 0},
-                }
-            ).encode()
-            request = Request(
-                f"{self.ollama_base_url}/api/chat",
-                data=body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
+                def model_for(_kind: str) -> Any:
+                    return model_backend
+            elif self.mode == "local":
 
-            def invoke_ollama() -> str:
-                with urlopen(request, timeout=self.timeout_seconds) as response:
-                    result = json.loads(response.read())
-                return str(result.get("message", {}).get("content", ""))
-
-            raw = await asyncio.to_thread(invoke_ollama)
-        else:
-            raise ProviderError("Provider de roteamento não suportado.")
-        try:
-            # Vertex may return valid structured content wrapped in a Markdown
-            # fence or with a short preamble despite response_mime_type. Extract
-            # the bounded JSON object before validating the route.
-            candidate = raw.strip().lstrip("\ufeff")
-            candidate = re.sub(r"```(?:json)?\s*|\s*```", "", candidate, flags=re.IGNORECASE)
-            decoder = json.JSONDecoder()
-            plan = None
-            for offset, char in enumerate(candidate):
-                if char != "{":
-                    continue
-                try:
-                    decoded, _ = decoder.raw_decode(candidate[offset:])
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(decoded, dict):
-                    plan = decoded
-                    break
-            if plan is None:
-                raise ValueError("Nenhum objeto JSON de rotas encontrado.")
-            if not isinstance(plan, dict):
-                raise ValueError("Plano deve ser objeto JSON.")
-
-            # Only two whitelisted intents are accepted. Normalize common
-            # Vertex/LLM JSON variations and do not delegate from free-form text.
-            def as_route(value: Any) -> bool:
-                if isinstance(value, bool):
-                    return value
-                if isinstance(value, str):
-                    normalized_value = value.strip().casefold()
-                    if normalized_value in {"true", "yes", "sim", "1"}:
-                        return True
-                    if normalized_value in {"false", "no", "não", "nao", "0"}:
-                        return False
-                if isinstance(value, int) and value in {0, 1}:
-                    return bool(value)
-                raise ValueError("Campo de rota inválido.")
-
-            schedule = as_route(plan.get("schedule", plan.get("agenda", False)))
-            faq = as_route(plan.get("faq", plan.get("policy", False)))
-            if not schedule and not faq:
-                faq = True
-            return schedule, faq
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise ProviderError(
-                "O modelo retornou plano de coordenação inválido "
-                f"({type(exc).__name__}: {str(exc)[:100]})."
-            ) from exc
-
-    async def ask(self, message: str, history: list[str] | None = None) -> AgentResult:
-        del history
-        start = time.monotonic()
-        budget = DelegationBudget()
-        deadline = Deadline(self.timeout_seconds)
-        normalized = message.casefold()
-        faq_phrases = (
-            "como faço",
-            "como posso",
-            "qual é",
-            "quais são",
-            "posso cancelar",
-            "tem opções",
-            "confirme minha reserva",
-            "duas reservas",
-            "sem token",
-            "token inválido",
-            "ações da empresa",
-            "no documento está escrito",
-            "instrução do faq",
-            "a faq diz",
-        )
-        faq_intent = any(phrase in normalized for phrase in faq_phrases)
-        has_schedule_intent = any(
-            word in normalized
-            for word in (
-                "agenda",
-                "palestra",
-                "sessão",
-                "sessões",
-                "após",
-                "sugira",
-                "sugerir",
-                "recomende",
-                "recomendar",
-                "iniciante",
-                "iniciantes",
-                "trilha",
-                "horário",
-            )
-        )
-        has_policy_intent = any(
-            word in normalized
-            for word in (
-                "regra",
-                "regras",
-                "política",
-                "politica",
-                "acessibilidade",
-                "cancelar",
-                "cancelamento",
-                "inscrição",
-                "inscricao",
-                "alimentação",
-                "alimentacao",
-            )
-        )
-        mixed_intent = has_schedule_intent and faq_intent and " e " in normalized
-        route_error: str | None = None
-        route_fallback = False
-        if self.mode == "live":
-            try:
-                async with asyncio.timeout(deadline.remaining()):
-                    is_schedule, is_faq = await self._route_with_model(message)
-            except Exception as exc:
-                # Safe deterministic recovery keeps the demo usable when model
-                # output is malformed. The model remains first choice; fallback
-                # only routes to read-only specialists using explicit intent.
-                is_schedule = has_schedule_intent
-                is_faq = has_policy_intent or faq_intent or not is_schedule
-                route_fallback = True
-                route_error = f"{type(exc).__name__}:{str(exc)[:100]}"
+                def model_for(_kind: str) -> Any:
+                    return _ollama_adk_model(self.model, self.ollama_base_url, self.timeout_seconds)
             else:
-                route_fallback = False
-        elif self.mode == "local":
-            # Keep local specialist selection deterministic and read-only; use
-            # catalog and policy signals instead of trusting free-form routing.
-            is_schedule = has_schedule_intent and (not faq_intent or mixed_intent)
-            is_faq = (
-                not is_schedule
-                or faq_intent
-                or any(
-                    word in normalized
-                    for word in ("inscrição", "acessibilidade", "alimentação", "cancelar")
-                )
+
+                def model_for(_kind: str) -> Any:
+                    return _OfflineADKLlm(self.model, _kind, message, self.sessions)
+
+            should_prepare_mcp = self.use_mcp and (
+                self.mode in {"live", "local"}
+                or _offline_route(message) in {"schedule_agent", "combined_agent"}
             )
-        else:
-            is_schedule = has_schedule_intent and (not faq_intent or mixed_intent)
-            is_faq = (
-                not is_schedule
-                or faq_intent
-                or any(
-                    word in normalized
-                    for word in ("inscrição", "acessibilidade", "alimentação", "cancelar")
+            if should_prepare_mcp:
+                if self.circuit_breaker:
+                    self.circuit_breaker.allow()
+                mcp = ScheduleMCPClient(
+                    timeout_seconds=min(self.timeout_seconds, 10),
+                    database=self.database,
+                    seed_catalog=self.database is None,
                 )
-            )
-        mcp: ScheduleMCPClient | None = None
-        try:
-            schedule_result: dict[str, Any] = {"session_ids": [], "answer": ""}
-            if is_schedule:
+                await mcp.start()
+
+            async def list_sessions(
+                track: str | None = None,
+                level: str | None = None,
+                after: str | None = None,
+                limit: int = 3,
+            ) -> dict[str, Any]:
+                nonlocal mcp
+                budget.record("mcp.list_sessions" if self.use_mcp else "schedule.list_sessions")
                 if self.use_mcp:
-                    if self.circuit_breaker:
-                        self.circuit_breaker.allow()
-                    mcp = ScheduleMCPClient(
-                        # Cloud Run scale-from-zero and low-CPU instances need
-                        # more than three seconds to start Python and initialize
-                        # the stdio MCP handshake. Keep within the request budget.
-                        timeout_seconds=min(self.timeout_seconds, 10.0),
-                        database=self.database,
-                        seed_catalog=self.database is None,
+                    assert mcp is not None
+                    result = await mcp.call_tool(
+                        "list_sessions",
+                        {"track": track, "level": level, "after": after, "limit": limit},
                     )
-                    async with asyncio.timeout(deadline.remaining()):
-                        await mcp.start()
-                schedule_result, schedule_retries = await run_with_retries(
-                    lambda: ScheduleAgent(self.sessions, mcp).run(message, budget),
-                    deadline,
-                    retry_if=lambda exc: isinstance(exc, (MCPClientError, TimeoutError)),
-                    max_retries=2,
-                )
-                if self.circuit_breaker and is_schedule:
-                    self.circuit_breaker.success()
-            else:
-                schedule_retries = 0
-            faq_result: dict[str, Any] = {"answer": "", "sources": []}
-            if is_faq:
-                faq_result = await FAQAgent().run(message, budget)
-            ids = schedule_result.get("session_ids", [])
-            sources = faq_result.get("sources", [])
-            known = {session.id for session in self.sessions}
-            if any(item not in known for item in ids):
-                raise ProviderError("O coordenador rejeitou IDs desconhecidos.")
-            answer = str(
-                schedule_result.get("answer")
-                or faq_result.get("answer")
-                or "Não encontrei evidência suficiente."
-            )
-            if is_schedule and is_faq and sources:
-                answer = f"{schedule_result['answer']} {faq_result['answer']}"
-            return AgentResult(
-                answer=answer,
-                session_ids=ids,
-                sources=sources,
-                reservation_proposal=(
-                    ids[0]
-                    if ids and any(word in normalized for word in ("reserv", "guardar", "vaga"))
-                    else None
+                else:
+                    result = DemoTools(self.sessions).list_sessions(
+                        track=track, level=level, after=after
+                    )
+                return result
+
+            async def search_policy(question: str) -> dict[str, Any]:
+                budget.record("faq.search_policy")
+                return await asyncio.to_thread(DemoTools([]).search_policy, question)
+
+            tools = [list_sessions, search_policy]
+            specialists: list[Any] = []
+            for name, instruction in (
+                (
+                    "schedule_agent",
+                    "Consulte list_sessions e responda somente JSON com answer, session_ids, "
+                    "sources e reservation_proposal. IDs devem vir da ferramenta. "
+                    "Nunca confirme reservas.",
                 ),
-                mode=f"{self.mode}:multi",
-                trace={
+                (
+                    "faq_agent",
+                    "Consulte search_policy e responda somente JSON com answer, session_ids, "
+                    "sources e reservation_proposal. Use somente a evidência retornada.",
+                ),
+                (
+                    "combined_agent",
+                    "Para solicitação mista, use list_sessions e search_policy; responda JSON "
+                    "com answer, session_ids, sources e reservation_proposal. "
+                    "Nunca confirme reservas.",
+                ),
+            ):
+                agent_model: Any = model_for(name)
+                selected_tools: list[Any] = (
+                    tools
+                    if name == "combined_agent"
+                    else ([list_sessions] if name == "schedule_agent" else [search_policy])
+                )
+                specialists.append(
+                    Agent(
+                        name=name,
+                        model=agent_model,
+                        description=instruction,
+                        instruction=instruction,
+                        tools=selected_tools,
+                    )
+                )
+            root_model: Any = model_for("coordinator")
+            root = Agent(
+                name="event_coordinator",
+                model=root_model,
+                instruction=(
+                    "Delegue para schedule_agent quando perguntarem sobre agenda ou palestras; "
+                    "faq_agent para políticas e informações; combined_agent para pedidos "
+                    "que pedem ambos. "
+                    "Nunca responda diretamente, nunca confirme reservas."
+                ),
+                sub_agents=specialists,
+            )
+            # ADK's built-in transfer_to_agent is the only orchestration mechanism.
+            session_service = InMemorySessionService()
+            runner = Runner(agent=root, app_name="eventops-ai", session_service=session_service)
+            user_id, session_id = "demo-user", str(uuid4())
+            await session_service.create_session(
+                app_name="eventops-ai", user_id=user_id, session_id=session_id
+            )
+            prompt = "\n".join(
+                [*(f"Histórico: {x}" for x in (history or [])[-4:]), f"Pergunta atual: {message}"]
+            )
+            final_text = ""
+            input_tokens = output_tokens = 0
+            usage_seen = False
+            try:
+                async with asyncio.timeout(self.timeout_seconds):
+                    async for event in runner.run_async(
+                        user_id=user_id,
+                        session_id=session_id,
+                        new_message=types.Content(role="user", parts=[types.Part(text=prompt)]),
+                    ):
+                        target = getattr(getattr(event, "actions", None), "transfer_to_agent", None)
+                        if target:
+                            budget.record(f"delegate:{target}")
+                            adk_tools.append(f"delegate:{target}")
+                            adk_events.append(
+                                {
+                                    "type": "transfer",
+                                    "agent": str(getattr(event, "author", "")),
+                                    "target": str(target),
+                                }
+                            )
+                        for part in getattr(getattr(event, "content", None), "parts", None) or []:
+                            call = getattr(part, "function_call", None)
+                            if not call or call.name == "transfer_to_agent":
+                                continue
+                            name = str(call.name)
+                            trace_name = {
+                                "list_sessions": "mcp.list_sessions"
+                                if self.use_mcp
+                                else "schedule.list_sessions",
+                                "check_schedule": "mcp.check_schedule"
+                                if self.use_mcp
+                                else "schedule.check_schedule",
+                                "search_policy": "faq.search_policy",
+                            }.get(name, name)
+                            adk_tools.append(trace_name)
+                            adk_events.append(
+                                {
+                                    "type": "tool_call",
+                                    "agent": str(getattr(event, "author", "")),
+                                    "name": name,
+                                    "trace_tool": trace_name,
+                                }
+                            )
+                        usage = getattr(event, "usage_metadata", None)
+                        if usage:
+                            p_tokens = getattr(usage, "prompt_token_count", None)
+                            c_tokens = getattr(usage, "candidates_token_count", None)
+                            if isinstance(p_tokens, int) and isinstance(c_tokens, int):
+                                input_tokens += p_tokens
+                                output_tokens += c_tokens
+                                usage_seen = True
+                        if event.is_final_response() and event.content:
+                            final_text = "".join(p.text or "" for p in event.content.parts or [])
+            finally:
+                await runner.close()
+            payload = _parse_result(final_text)
+            known = {s.id for s in self.sessions}
+            ids = payload.get("session_ids", [])
+            if not isinstance(ids, list) or any(i not in known for i in ids):
+                raise ProviderError("O ADK retornou IDs de sessão inválidos.")
+            sources = payload.get("sources", [])
+            if not isinstance(sources, list):
+                sources = []
+            if (
+                self.circuit_breaker
+                and self.use_mcp
+                and any(t.endswith("list_sessions") for t in budget.tools)
+            ):
+                self.circuit_breaker.success()
+            return AgentResult(
+                str(payload.get("answer") or "Não encontrei evidência suficiente."),
+                ids,
+                sources,
+                payload.get("reservation_proposal"),
+                f"{self.mode}:multi",
+                {
                     "request_id": f"multi-{time.time_ns()}",
                     "mode": f"{self.mode}:multi",
                     "model": self.model,
                     "dataset_version": COORDINATOR_PROMPT_VERSION,
-                    "duration_ms": round((time.monotonic() - start) * 1000, 2),
+                    "duration_ms": round((time.monotonic() - started) * 1000, 2),
                     "tool_calls": budget.tool_calls,
-                    "retries": schedule_retries,
                     "delegations": budget.delegations,
-                    "tools": budget.tools,
-                    "input_tokens": None,
-                    "output_tokens": None,
+                    "tools": adk_tools,
+                    "adk_events": adk_events,
+                    "input_tokens": input_tokens if usage_seen else None,
+                    "output_tokens": output_tokens if usage_seen else None,
                     "status": "ok",
-                    "raw_output": None,
+                    "raw_output": final_text,
                     "validated": True,
-                    "fallback": route_fallback if self.mode in {"live", "local"} else False,
-                    "route_fallback_reason": (
-                        route_error if self.mode in {"live", "local"} else None
-                    ),
+                    "fallback": self.mode == "offline",
                     "reservation_writes": 0,
-                    "circuit_state": (
-                        self.circuit_breaker.state.value if self.circuit_breaker else "unconfigured"
-                    ),
+                    "circuit_state": self.circuit_breaker.state.value
+                    if self.circuit_breaker
+                    else "unconfigured",
                 },
             )
-        except (ProviderError, MCPClientError, CircuitOpen, TimeoutError, ValueError) as exc:
-            if self.circuit_breaker and isinstance(exc, (MCPClientError, TimeoutError)):
-                for _ in range(max(1, budget.tool_calls)):
-                    self.circuit_breaker.failure()
+        except Exception as exc:
+            if self.circuit_breaker and isinstance(exc, (TimeoutError, OSError)):
+                self.circuit_breaker.failure()
+            error = str(exc) or type(exc).__name__
             partial_answer = ""
-            partial_sources: list[dict[str, str]] = []
-            if is_faq and budget.delegations < budget.max_delegations:
+            partial_sources: list[dict[str, Any]] = []
+            if (
+                isinstance(exc, Exception)
+                and self.circuit_breaker
+                and self.circuit_breaker.state.value == "open"
+            ):
                 try:
-                    partial = await FAQAgent().run(message, budget)
+                    budget.delegate("faq_agent")
+                    budget.record_tool("faq.search_policy")
+                    partial = await asyncio.to_thread(DemoTools([]).search_policy, message)
                     partial_answer = str(partial.get("answer", ""))
                     partial_sources = partial.get("sources", [])
-                except ProviderError:
-                    pass
+                except Exception:
+                    partial_answer = ""
             return AgentResult(
-                (
-                    "Agenda indisponível; resposta parcial baseada na FAQ: " + partial_answer
-                    if partial_answer
-                    else (
-                        "O coordenador não conseguiu concluir. "
-                        "Use agenda/FAQ offline ou tente novamente."
-                    )
-                ),
+                ("Agenda indisponível; resposta parcial baseada na FAQ: " + partial_answer)
+                if partial_answer
+                else "O coordenador ADK não conseguiu concluir. Tente novamente.",
                 [],
                 partial_sources,
                 None,
@@ -498,25 +692,37 @@ class CoordinatorAgent:
                     "mode": f"{self.mode}:multi",
                     "model": self.model,
                     "dataset_version": COORDINATOR_PROMPT_VERSION,
-                    "duration_ms": round((time.monotonic() - start) * 1000, 2),
+                    "duration_ms": round((time.monotonic() - started) * 1000, 2),
                     "tool_calls": budget.tool_calls,
-                    "retries": max(0, budget.tool_calls - 1),
                     "delegations": budget.delegations,
-                    "tools": budget.tools,
+                    "tools": adk_tools,
+                    "adk_events": adk_events,
                     "input_tokens": None,
                     "output_tokens": None,
-                    "status": "partial" if partial_answer else "error",
+                    "status": "error",
                     "raw_output": None,
                     "validated": False,
                     "fallback": True,
                     "reservation_writes": 0,
                     "partial": bool(partial_answer),
-                    "circuit_state": (
-                        self.circuit_breaker.state.value if self.circuit_breaker else "unconfigured"
-                    ),
                 },
-                error=str(exc),
+                error=error,
             )
         finally:
             if mcp is not None:
                 await mcp.close()
+
+
+def _parse_result(raw: str) -> dict[str, Any]:
+    candidate = raw.strip().lstrip("\ufeff")
+    candidate = re.sub(r"```(?:json)?\s*|\s*```", "", candidate, flags=re.IGNORECASE)
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(candidate):
+        if char == "{":
+            try:
+                value, _ = decoder.raw_decode(candidate[index:])
+                if isinstance(value, dict):
+                    return value
+            except json.JSONDecodeError:
+                continue
+    raise ProviderError("O agente ADK não retornou JSON válido.")

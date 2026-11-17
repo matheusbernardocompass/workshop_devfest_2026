@@ -3,12 +3,14 @@
 ## Modos
 
 - `EVENTOPS_MODE` seleciona o perfil do produto e permanece `offline` no demo.
-- `EVENTOPS_AGENT_MODE=offline` dá respostas determinísticas e não chama APIs.
-- `local` usa Ollama; `live` usa Google ADK/Gemini. Credenciais e configuração
-  Vertex AI usam API key ou ADC conforme o provider/configuração selecionados.
-- A interface pode escolher arquitetura `single` ou `multi`. O coordenador
-  escolhe especialistas; agenda/FAQ são verificadas por ferramentas locais e o
-  especialista de agenda pode usar MCP stdio.
+- `EVENTOPS_AGENT_MODE=offline` dá respostas determinísticas e não chama APIs;
+  o coordenador offline continua executando pelo `Runner` e grafo de agentes ADK.
+- `local` usa Ollama através de um adaptador `BaseLlm` do ADK; `live` usa
+  Gemini/Vertex pelo ADK. Credenciais são passadas a clientes por requisição.
+- A interface pode escolher arquitetura `single` ou `multi`. No multi, um
+  `Agent` coordenador ADK transfere para especialistas de agenda, FAQ ou fluxo
+  combinado. `transfer_to_agent` e chamadas de ferramenta aparecem no trace.
+  Agenda usa MCP stdio quando configurado; FAQ consulta documentos verificados.
 
 ## Limites de segurança
 
@@ -27,8 +29,8 @@
   transitórias elegíveis e dentro do deadline.
 - Circuit breaker do provider e proteção do transporte MCP impedem repetição
   contínua em falhas. Falhas não são reportadas como sucesso.
-- O controle de retries internos do SDK Gemini permanece uma limitação de
-  integração; veja [pendências](../pendencias.md).
+- O adaptador Ollama converte chamadas de ferramenta entre a API de chat local
+  e o contrato `BaseLlm` do ADK.
 
 ## Código e validação
 
@@ -42,7 +44,6 @@
 
 ## Limite da evidência
 
-O smoke Gemini single/multi/MCP foi aprovado na implantação temporária em
-10/10/2026. A cloud foi removida depois do smoke. Os especialistas continuam
-determinísticos; isso não demonstra agentes especialistas independentes com
-LLMs nem aprovação da comparação live.
+O comparativo offline executa os agentes ADK sem credenciais externas. Isso
+valida transferência, ferramentas e contratos locais; a comparação live continua
+dependente de credenciais Gemini/Vertex e não foi executada por esse gate.

@@ -245,7 +245,9 @@ class ADKProvider:
             from google.adk.sessions import InMemorySessionService
             from google.genai import types
         except ImportError as exc:
-            raise ProviderError("Instale o extra live com `pip install -e '.[agent]'`.") from exc
+            raise ProviderError(
+                "Instale as dependências do projeto, incluindo google-adk."
+            ) from exc
         import os
 
         previous = {

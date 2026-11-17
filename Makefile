@@ -4,7 +4,7 @@ PYTHON ?= python
 
 setup:
 	$(PYTHON) -c 'import sys; assert sys.version_info[:2] == (3, 11), "Use Python 3.11"'
-	$(PYTHON) -m pip install --require-hashes -r requirements/py311-dev-agent.txt
+	$(PYTHON) -m pip install --require-hashes -r requirements/py311-dev.txt
 	$(PYTHON) -m pip install --no-deps -e .
 
 run:

@@ -39,6 +39,7 @@ async def run_case(agent: CaseAgent, case: dict[str, Any]) -> AgentResult:
     final = results[-1]
     trace = dict(final.trace)
     trace["tools"] = [tool for item in results for tool in item.trace.get("tools", [])]
+    trace["adk_events"] = [event for item in results for event in item.trace.get("adk_events", [])]
     trace["tool_calls"] = sum(int(item.trace.get("tool_calls", 0)) for item in results)
     trace["reservation_writes"] = sum(
         int(item.trace.get("reservation_writes", 0)) for item in results
@@ -98,7 +99,9 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
-def evaluate_case(case: dict[str, Any], result: AgentResult) -> dict[str, Any]:
+def evaluate_case(
+    case: dict[str, Any], result: AgentResult, *, architecture: str = "single"
+) -> dict[str, Any]:
     reasons: list[str] = []
     checked_output = "\n".join(
         [
@@ -128,6 +131,13 @@ def evaluate_case(case: dict[str, Any], result: AgentResult) -> dict[str, Any]:
             for tool in tool_names
         ):
             reasons.append("tool fora da allowlist")
+        expected_trajectory = (
+            case.get("expected_trajectory_multi") if architecture == "multi" else None
+        )
+        if expected_trajectory is not None and trajectory != expected_trajectory:
+            reasons.append(
+                f"fluxo ADK inesperado: esperado {expected_trajectory}, recebido {trajectory}"
+            )
         if len(result.session_ids) < int(case.get("expected_min_sessions", 0)):
             reasons.append("faltam sessões esperadas")
         expected_source = case.get("expected_source")

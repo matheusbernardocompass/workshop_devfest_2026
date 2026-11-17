@@ -64,7 +64,7 @@ Em macOS/Windows, instale o navegador com `python -m playwright install chromium
 
 `EVENTOPS_MODE` controla o modo da aplicação e permanece `offline`. `EVENTOPS_AGENT_MODE` escolhe o provider do chat:
 
-- `offline` (padrão): respostas determinísticas, sem baixar modelo nem chamar APIs.
+- `offline` (padrão): respostas determinísticas, sem baixar modelo nem chamar APIs. O fluxo multi usa o grafo ADK com um modelo determinístico de avaliação.
 - `local`: usa Ollama. Defina `EVENTOPS_AGENT_MODE=local` no `.env`. Para CPU, inicie a aplicação e Ollama e baixe o modelo:
 
   ```bash
@@ -78,9 +78,9 @@ Em macOS/Windows, instale o navegador com `python -m playwright install chromium
   docker compose -f compose.yaml -f compose.gpu.yaml --profile gpu up --build -d app ollama
   docker compose -f compose.yaml -f compose.gpu.yaml --profile gpu run --rm model-init
   ```
-- `live`: usa Gemini via Google ADK. A imagem Docker Compose atual não inclui esse extra opcional; use o ambiente Python instalado por `make setup`, carregue `EVENTOPS_AGENT_MODE=live` e `GOOGLE_API_KEY` no shell e rode `make run`. Chamadas live usam serviço externo e podem consumir quota; não coloque a chave no Git.
+- `live`: usa Gemini via Google ADK, já incluído na imagem Docker Compose e no runtime. Configure `EVENTOPS_AGENT_MODE=live` e `GOOGLE_API_KEY`. Chamadas live usam serviço externo e podem consumir quota; não coloque a chave no Git.
 
-O seletor da interface permite escolher Agente único ou Coordenador + especialistas. Em modo `live`, Gemini responde no single e faz o roteamento do coordenador multi; em `local`, Ollama faz os dois papéis. Os especialistas usam ferramentas locais verificadas nos dois modos. Para instruções de reset, banco, diagnóstico e avaliação, consulte [operação local](docs/operacao-local.md). Dependências Python são fixadas nos locks SHA-256 em `requirements/`.
+O seletor da interface permite escolher Agente único ou Coordenador + especialistas. No multi, um `Agent` coordenador ADK transfere para agentes de agenda, FAQ ou fluxo combinado; o trace registra cada transferência e ferramenta executada. Em `live`, Gemini coordena e responde nos especialistas; em `local`, Ollama usa a interface de modelo do ADK. Para instruções de reset, banco, diagnóstico e avaliação, consulte [operação local](docs/operacao-local.md). Dependências Python são fixadas nos locks SHA-256 em `requirements/`.
 
 ### Reset local seguro
 

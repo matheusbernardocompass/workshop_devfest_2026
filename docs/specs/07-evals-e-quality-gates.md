@@ -7,6 +7,10 @@
 - O loader valida formato, IDs, fontes, estado inicial, ferramentas permitidas e
   ações proibidas. Oráculos fixos e estado do banco conferem efeitos, não apenas
   texto retornado.
+- Cada caso registra `expected_tool` e `allowed_tools`; para multi, também
+  `expected_trajectory_multi` descreve a sequência de transferências ADK e
+  ferramentas. `evaluate_case(..., architecture="multi")` compara essa
+  sequência com `result.trace["tools"]`.
 - Casos RAG lexical/híbrido e segurança ficam em `evals/rag_cases.jsonl` e
   `evals/rag_security_cases.jsonl`.
 - Execução offline não chama Gemini nem consome quota. Evals live exigem

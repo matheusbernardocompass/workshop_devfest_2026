@@ -34,6 +34,9 @@ def main() -> int:
         COMPOSE_PROJECT_NAME=project,
         EVENTOPS_PORT=str(port),
         EVENTOPS_AGENT_MODE="offline",
+        EVENTOPS_DATABASE_URL="",
+        EVENTOPS_RAG_DATABASE_URL="",
+        EVENTOPS_RAG_MODE="lexical",
         EVENTOPS_SEED_CATALOG="true",
     )
     base = f"http://127.0.0.1:{port}"

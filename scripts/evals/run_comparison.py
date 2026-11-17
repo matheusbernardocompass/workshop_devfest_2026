@@ -17,7 +17,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from app.agent import PROMPT_VERSION, ProviderError, make_agent  # noqa: E402
+from app.agent import PROMPT_VERSION, AgentResult, ProviderError, make_agent  # noqa: E402
 from app.agents.coordinator import COORDINATOR_PROMPT_VERSION, CoordinatorAgent  # noqa: E402
 from app.data_validation import load_session_seed  # noqa: E402
 from app.evaluators import evaluate_case, execute_case_state, load_cases, run_case  # noqa: E402
@@ -58,9 +58,9 @@ class BudgetedCoordinator(CoordinatorAgent):
         super().__init__(*args, **kwargs)
         self.request_budget = request_budget
 
-    async def _route_with_model(self, message: str) -> tuple[bool, bool]:
+    async def ask(self, message: str, history: list[str] | None = None) -> AgentResult:
         self.request_budget.reserve("multi")
-        return await super()._route_with_model(message)
+        return await super().ask(message, history)
 
 
 def planned_requests(cases: list[dict[str, Any]]) -> int:
@@ -324,7 +324,7 @@ async def compare(
                     )
                     result.trace["comparison_budget_exhaustions"] = budget.exhaustions
                 execute_case_state(case, result, sessions)
-                verdict = evaluate_case(case, result)
+                verdict = evaluate_case(case, result, architecture=name)
                 attempt.update(
                     {
                         "status": "completed",
